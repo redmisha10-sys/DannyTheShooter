@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Restaurant Shooter</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: #000;
+    touch-action: none;
+    overscroll-behavior: none;
+    user-select: none; -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #bg {
+    position: fixed; inset: 0;
+    width: 100%; height: 100%;
+    display: block;
+    touch-action: none;
+  }
+  #joystick-bg {
+    display: none;
+    position: fixed;
+    left: 24px; bottom: 24px;
+    width: 140px; height: 140px;
+    background: rgba(255,255,255,0.15);
+    border: 2px solid rgba(255,255,255,0.5);
+    border-radius: 50%;
+    z-index: 10;
+    touch-action: none;
+  }
+  #stick {
+    width: 60px; height: 60px;
+    background: rgba(255,255,255,0.85);
+    border-radius: 50%;
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%,-50%);
+    pointer-events: none;
+  }
+  /* Show joystick only on touch-primary devices */
+  @media (hover: none) and (pointer: coarse) {
+    #joystick-bg { display: block; }
+  }
+</style>
+</head>
+<body>
+<canvas id="bg"></canvas>
+<div id="joystick-bg"><div id="stick"></div></div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---------- Canvas + DPI-safe resize ----------
+  const canvas = document.getElementById('bg');
+  const ctx = canvas.getContext('2d');
+  let bgWidth = 0, bgHeight = 0;
+let totalTimer = 0;
+  const danny = {
+    x: 0, y: 0,
+    vx: 0, vy: 0,
+    radius: 22,
+    maxSpeed: 400,       // px / s
+    responseSpeed: 14    // how fast we approach target velocity (1/s)
+  };
+
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    bgWidth  = canvas.clientWidth;
+    bgHeight = canvas.clientHeight;
+    canvas.width  = Math.round(bgWidth  * dpr);
+    canvas.height = Math.round(bgHeight * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    if (danny.x === 0 && danny.y === 0) {
+      danny.x = bgWidth / 2;
+      danny.y = bgHeight / 2;
+    }
+    danny.x = Math.max(danny.radius, Math.min(bgWidth  - danny.radius, danny.x));
+    danny.y = Math.max(danny.radius, Math.min(bgHeight - danny.radius, danny.y));
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- Images (fallback shapes drawn if not loaded) ----------
+  const dannyImg       = new Image(); dannyImg.src       = 'dannyimg.png';
+  const plateImg       = new Image(); plateImg.src       = 'plateimg.png';
+  const brokenPlateImg = new Image(); brokenPlateImg.src = 'brokenplateimg.png';
+  const bgImg          = new Image(); bgImg.src          = 'bgimg.png';
+  const imgReady = img => img.complete && img.naturalWidth > 0;
+
+  // ---------- State ----------
+  let score = 0;
+  let coolDown = 0;
+  let spawnTimer = 0;
+
+  const SPAWN_INTERVAL = 0.55;
+  const SPAWN_MARGIN   = 120;
+  const PLATE_RADIUS   = 20;
+  const BULLET_RADIUS  = 6;
+  const BULLET_SPEED   = 750;
+  const BULLET_COOLDOWN = 0.09;
+
+  const plates  = [];
+  const bullets = [];
+
+  // ---------- Keyboard (attach once!) ----------
+  const keys = Object.create(null);
+  window.addEventListener('keydown', e => {
+    keys[e.key] = true;
+    if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+  });
+  window.addEventListener('keyup', e => { keys[e.key] = false; });
+  window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+
+  // ---------- Joystick ----------
+  const joystickBg = document.getElementById('joystick-bg');
+  const stick      = document.getElementById('stick');
+  let joystickActive   = false;
+  let joystickPointerId = null;
+  let joystickDx = 0, joystickDy = 0;
+
+  function getBaseCenter() {
+    const r = joystickBg.getBoundingClientRect();
+    return { cx: r.left + r.width / 2, cy: r.top + r.height / 2, max: r.width / 2 };
+  }
+  function applyJoystick(clientX, clientY) {
+    const { cx, cy, max } = getBaseCenter();
+    let dx = clientX - cx;
+    let dy = clientY - cy;
+    const dist = Math.hypot(dx, dy);
+    if (dist > max) { dx = dx / dist * max; dy = dy / dist * max; }
+    stick.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
+    joystickDx = dx / max;
+    joystickDy = dy / max;
+  }
+  joystickBg.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    joystickActive = true;
+    joystickPointerId = e.pointerId;
+    joystickBg.setPointerCapture(e.pointerId);
+    applyJoystick(e.clientX, e.clientY);
+  });
+  joystickBg.addEventListener('pointermove', e => {
+    if (!joystickActive || e.pointerId !== joystickPointerId) return;
+    e.preventDefault();
+    applyJoystick(e.clientX, e.clientY);
+  });
+  function releaseJoystick(e) {
+    if (e.pointerId !== joystickPointerId) return;
+    joystickActive = false;
+    joystickPointerId = null;
+    joystickDx = joystickDy = 0;
+    stick.style.transform = 'translate(-50%, -50%)';
+  }
+  joystickBg.addEventListener('pointerup',     releaseJoystick);
+  joystickBg.addEventListener('pointercancel', releaseJoystick);
+
+  // ---------- Shooting ----------
+  function shoot(targetX, targetY) {
+    if (coolDown > 0) return;
+    let dx = targetX - danny.x;
+    let dy = targetY - danny.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 1) return;             // ignore taps right on top of Danny
+    dx /= len; dy /= len;
+    bullets.push({
+      x: danny.x, y: danny.y,
+      vx: dx * (BULLET_SPEED-totalTimer/60+100),
+      vy: dy * (BULLET_SPEED-totalTimer/60+100),
+      radius: BULLET_RADIUS
+    });
+    coolDown = BULLET_COOLDOWN;
+  }
+
+  canvas.addEventListener('pointerdown', e => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;  // left click only
+    const r = canvas.getBoundingClientRect();
+    shoot(e.clientX - r.left, e.clientY - r.top);
+  });
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+  // ---------- Plate spawning ----------
+  function spawnPlate() {
+    const edge = Math.floor(Math.random() * 4);
+    const speed = 120 + Math.random() * 160+totalTimer/20;
+    const jitter = (Math.random() - 0.5) * 0.8;   // ~±23°
+    let x, y, angle;
+
+    if (edge === 0) {          // from top
+      x = Math.random() * bgWidth;
+      y = -SPAWN_MARGIN;
+      angle =  Math.PI / 2 + jitter;
+    } else if (edge === 1) {   // from right
+      x = bgWidth + SPAWN_MARGIN;
+      y = Math.random() * bgHeight;
+      angle =  Math.PI + jitter;
+    } else if (edge === 2) {   // from bottom
+      x = Math.random() * bgWidth;
+      y = bgHeight + SPAWN_MARGIN;
+      angle = -Math.PI / 2 + jitter;
+    } else {                   // from left
+      x = -SPAWN_MARGIN;
+      y = Math.random() * bgHeight;
+      angle = jitter;
+    }
+
+    plates.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      radius: PLATE_RADIUS,
+      state: 'intact',   // 'intact' | 'broken'
+      fadeTimer: 0
+    });
+  }
+
+  // ---------- Update ----------
+  function update(dt) {
+totalTimer++;
+    // --- player movement ---
+    let ax = 0, ay = 0;
+    if (keys['ArrowLeft'])  ax -= 1;
+    if (keys['ArrowRight']) ax += 1;
+    if (keys['ArrowUp'])    ay -= 1;
+    if (keys['ArrowDown'])  ay += 1;
+    if (joystickActive) { ax += joystickDx; ay += joystickDy; }
+
+    const inLen = Math.hypot(ax, ay);
+    if (inLen > 1) { ax /= inLen; ay /= inLen; }
+
+    // move toward target velocity (analog-friendly)
+    const targetVx = ax * danny.maxSpeed;
+    const targetVy = ay * danny.maxSpeed;
+    const t = Math.min(1, danny.responseSpeed * dt);
+    danny.vx += (targetVx - danny.vx) * t;
+    danny.vy += (targetVy - danny.vy) * t;
+
+    danny.x += danny.vx * dt;
+    danny.y += danny.vy * dt;
+
+    // clamp to arena
+    if (danny.x < danny.radius)             { danny.x = danny.radius;             danny.vx = 0; }
+    if (danny.x > bgWidth  - danny.radius)  { danny.x = bgWidth  - danny.radius;  danny.vx = 0; }
+    if (danny.y < danny.radius)             { danny.y = danny.radius;             danny.vy = 0; }
+    if (danny.y > bgHeight - danny.radius)  { danny.y = bgHeight - danny.radius;  danny.vy = 0; }
+
+    if (coolDown > 0) coolDown -= dt;
+
+    // --- spawn ---
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) { spawnTimer = SPAWN_INTERVAL; spawnPlate(); }
+
+    // --- bullets ---
+    for (let i = bullets.length - 1; i >= 0; i--) {
+      const b = bullets[i];
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      if (b.x < -40 || b.x > bgWidth + 40 || b.y < -40 || b.y > bgHeight + 40) {
+        bullets.splice(i, 1);
+      }
+    }
+
+    // --- plates ---
+    for (let i = plates.length - 1; i >= 0; i--) {
+      const p = plates[i];
+      if (p.state === 'broken') {
+        p.fadeTimer += dt;
+        if (p.fadeTimer >= 1) plates.splice(i, 1);
+        continue;
+      }
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      if (p.x < -220 || p.x > bgWidth + 220 || p.y < -220 || p.y > bgHeight + 220) {
+        plates.splice(i, 1);
+      }
+    }
+
+    // --- bullet vs plate ---
+    for (let i = bullets.length - 1; i >= 0; i--) {
+      const b = bullets[i];
+      let hit = false;
+      for (const p of plates) {
+        if (p.state !== 'intact') continue;
+        const dx = b.x - p.x;
+        const dy = b.y - p.y;
+        const rr = b.radius + p.radius;
+        if (dx * dx + dy * dy <= rr * rr) {
+          p.state = 'broken';
+          p.fadeTimer = 0;
+          score += 1;
+          hit = true;
+          break;
+        }
+      }
+      if (hit) bullets.splice(i, 1);
+    }
+  }
+
+  // ---------- Draw ----------
+  function draw() {
+    // background
+    if (imgReady(bgImg)) ctx.drawImage(bgImg, 0, 0, bgWidth, bgHeight);
+    else { ctx.fillStyle = '#2a2a2a'; ctx.fillRect(0, 0, bgWidth, bgHeight); }
+
+    // plates
+    for (const p of plates) {
+      const img = p.state === 'intact' ? plateImg : brokenPlateImg;
+      ctx.globalAlpha = p.state === 'broken' ? Math.max(0, 1 - p.fadeTimer) : 1;
+      if (imgReady(img)) {
+        const s = p.radius * 2;
+        ctx.drawImage(img, p.x - p.radius, p.y - p.radius, s, s);
+      } else {
+        ctx.fillStyle = p.state === 'intact' ? '#fff' : '#888';
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // bullets
+    ctx.fillStyle = '#ffd24a';
+    for (const b of bullets) {
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Danny (centered)
+    if (imgReady(dannyImg)) {
+      const s = danny.radius * 3;
+      ctx.drawImage(dannyImg, danny.x - s / 2, danny.y - s / 2, s, s);
+    } else {
+      ctx.fillStyle = '#b06a2c';
+      ctx.beginPath();
+      ctx.arc(danny.x, danny.y, danny.radius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // HUD
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 20px system-ui, sans-serif';
+    ctx.textBaseline = 'top';
+    ctx.fillText('Score: ' + score, 16, 16);
+	ctx.fillStyle = '#fff';
+    ctx.font = 'bold 20px system-ui, sans-serif';
+    ctx.textBaseline = 'top';
+    ctx.fillText('Timer: ' + Math.floor(totalTimer/60) , 16, 40);
+  }
+
+  // ---------- Main loop (dt based) ----------
+  let lastTime = 0;
+  function gameLoop(now) {
+    if (!lastTime) lastTime = now;
+    let dt = (now - lastTime) / 1000;
+    lastTime = now;
+    if (dt > 0.1) dt = 0.1;          // clamp when tab is backgrounded
+    update(dt);
+    draw();
+    requestAnimationFrame(gameLoop);
+  }
+  requestAnimationFrame(gameLoop);
+})();
+</script>
+</body>
+</html>
